@@ -475,7 +475,7 @@ def test_packed_broadcast_midstream_failure_reaches_consumer(monkeypatch):
     assert consumer_group.current_index == len(producer_group.broadcasted_tensors)
 
 
-def test_packed_broadcast_consumer_drains_after_load_failure(monkeypatch):
+def _force_cpu_packed_broadcast(monkeypatch):
     class ImmediateStream:
         def synchronize(self):
             return None
@@ -502,6 +502,8 @@ def test_packed_broadcast_consumer_drains_after_load_failure(monkeypatch):
     )
     monkeypatch.setattr("nemo_rl.utils.packed_tensor.get_num_buffers", lambda: 1)
 
+
+def _broadcast_two_single_tensor_frames() -> MockCommunicationGroup:
     producer_group = MockCommunicationGroup()
     packed_broadcast_producer(
         iterator=iter(
@@ -514,6 +516,18 @@ def test_packed_broadcast_consumer_drains_after_load_failure(monkeypatch):
         src=0,
         post_iter_func=lambda item: item[1],
     )
+    return producer_group
+
+
+_TWO_FRAME_CONSUMER_METADATA = [
+    ("first.weight", ((1,), torch.float32)),
+    ("second.weight", ((1,), torch.float32)),
+]
+
+
+def test_packed_broadcast_consumer_drains_after_load_failure(monkeypatch):
+    _force_cpu_packed_broadcast(monkeypatch)
+    producer_group = _broadcast_two_single_tensor_frames()
 
     callback_error = RuntimeError("injected consumer load failure")
     callback_names = []
@@ -525,12 +539,7 @@ def test_packed_broadcast_consumer_drains_after_load_failure(monkeypatch):
     consumer_group = MockConsumerCommunicationGroup(producer_group.broadcasted_tensors)
     with pytest.raises(RuntimeError, match="injected consumer load failure") as error:
         packed_broadcast_consumer(
-            iterator=iter(
-                [
-                    ("first.weight", ((1,), torch.float32)),
-                    ("second.weight", ((1,), torch.float32)),
-                ]
-            ),
+            iterator=iter(_TWO_FRAME_CONSUMER_METADATA),
             group=consumer_group,
             src=0,
             post_unpack_func=fail_first_load,
@@ -538,4 +547,28 @@ def test_packed_broadcast_consumer_drains_after_load_failure(monkeypatch):
 
     assert error.value is callback_error
     assert callback_names == [["first.weight"]]
+    assert consumer_group.current_index == len(producer_group.broadcasted_tensors)
+
+
+def test_packed_broadcast_lazy_consumer_drains_when_closed_early(monkeypatch):
+    _force_cpu_packed_broadcast(monkeypatch)
+    producer_group = _broadcast_two_single_tensor_frames()
+
+    consumer_group = MockConsumerCommunicationGroup(producer_group.broadcasted_tensors)
+    weights = packed_broadcast_consumer(
+        iterator=iter(_TWO_FRAME_CONSUMER_METADATA),
+        group=consumer_group,
+        src=0,
+        post_unpack_func=None,
+        return_iterator=True,
+    )
+
+    assert weights is not None
+    name, tensor = next(weights)
+    assert name == "first.weight"
+    assert torch.equal(tensor, torch.tensor([1.0]))
+    assert consumer_group.current_index < len(producer_group.broadcasted_tensors)
+
+    weights.close()
+
     assert consumer_group.current_index == len(producer_group.broadcasted_tensors)

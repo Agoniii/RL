@@ -421,7 +421,9 @@ def packed_broadcast_consumer(
 
     Note:
         Synchronous Python unpack and load-callback failures are preserved while
-        remaining frames are drained through the terminal frame. Stream
+        remaining frames are drained through the terminal frame. A lazy iterator
+        that the caller closes or abandons before exhaustion also drains the
+        remaining frames. Stream
         synchronization, CUDA allocation/kernel/OOM, and NCCL/broadcast failures
         are communicator-fatal and propagate directly because further
         collectives on that context or transport are not reliable. Peer liveness
@@ -438,11 +440,23 @@ def packed_broadcast_consumer(
     if return_iterator:
 
         def weight_iterator() -> Iterator[tuple[str, torch.Tensor]]:
+            exhausted = False
             try:
                 for batch in batches:
                     for weight in batch:
                         yield weight
+                exhausted = True
             finally:
+                if not exhausted:
+                    # The caller stopped early (load failure or abandon). Keep
+                    # pulling frames so the producer is not left broadcasting
+                    # into a consumer that stopped participating. The caller's
+                    # error is the actionable one, so drain errors are dropped.
+                    try:
+                        for _ in batches:
+                            pass
+                    except Exception:
+                        pass
                 close_batches = getattr(batches, "close", None)
                 if close_batches is not None:
                     close_batches()
