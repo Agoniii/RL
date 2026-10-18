@@ -217,6 +217,9 @@ class AutomodelConfig(TypedDict):
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
     checkpoint: NotRequired[AutomodelCheckpointConfig]
+    # Bitwise-reproducible forward/backward via deterministic kernels, at some
+    # step-time cost. Applies to policy workers only.
+    deterministic: NotRequired[bool]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -502,6 +505,14 @@ class MegatronConfig(TypedDict):
     # Create gloo process groups during Megatron distributed init.
     # Omitted: use the Megatron Bridge default.
     use_gloo_process_groups: NotRequired[bool]
+    # Collective timeout (minutes) for the default process group and the
+    # Megatron model-parallel and replica groups. Raise it when one rank can stall for
+    # longer than the default, e.g. a dist-checkpoint shard write on a slow
+    # shared filesystem holds up the save-finalize / load collectives.
+    # Omitted or None: the torch.distributed / Megatron Bridge default (10 min).
+    # Set it in every megatron_cfg that runs Megatron workers (in PPO, both
+    # policy and value).
+    distributed_timeout_minutes: NotRequired[float | None]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
@@ -701,6 +712,10 @@ class PolicyConfig(TypedDict):
     # This sets the clipping norm for the AutomodelPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float | int]
+    # Run the policy offload lifecycle before non-colocated refit.
+    offload_policy_before_refit: bool
+    # Move optimizer state to CPU when offload_before_refit runs.
+    offload_optimizer_for_refit: bool
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
         list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
