@@ -199,6 +199,9 @@ If `optimizer` is `null`, draft parameters use the policy optimizer settings.
 ## Common Configuration Errors
 
 - `context_parallel_size > 1` with packing disabled
+- `context_parallel_size > 1` without `data_plane.enabled=true`, or with
+  `grpo.async_grpo.enabled=true`
+- async GRPO with `data_plane.enabled=false`
 - target sequence parallelism with packing disabled
 - target TP other than 2, or training PP/virtual PP greater than 1
 - generation CP or PP greater than 1
