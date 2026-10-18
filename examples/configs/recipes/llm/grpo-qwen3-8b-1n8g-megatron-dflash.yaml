@@ -31,6 +31,7 @@ policy:
     speculator_type: dflash
     enabled: true
     model_name: z-lab/Qwen3-8B-DFlash-b16
+    model_revision: 9b41424b7109f9c5413454f481b09a82b85333f4  # pragma: allowlist secret
     loss_weight: 1.0
     gamma: 5
     anchors_per_sample: 2
@@ -46,6 +47,7 @@ policy:
       speculative_config:
         method: dflash
         model: ${policy.draft.model_name}
+        revision: ${policy.draft.model_revision}
         num_speculative_tokens: ${policy.draft.gamma}
         draft_tensor_parallel_size: 1
       compilation_config:
