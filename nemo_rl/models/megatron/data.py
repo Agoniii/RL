@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from contextlib import nullcontext
 from dataclasses import dataclass
 from math import lcm
-from typing import Any, Iterator, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, Optional, Sequence, Tuple
 
 import torch
 from megatron.bridge.training.utils.packed_seq_utils import (
@@ -26,6 +28,8 @@ from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_context_parallel_rank,
     get_context_parallel_world_size,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
 )
 from megatron.core.utils import StragglerDetector, get_batch_on_this_cp_rank
 
@@ -40,7 +44,10 @@ from nemo_rl.data_plane.codec import pad_field
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS, OPD_FULL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
-from nemo_rl.models.megatron.alignment import get_fp8_token_alignment
+from nemo_rl.models.megatron.alignment import (
+    get_fp8_token_alignment,
+    get_parallel_token_alignment,
+)
 from nemo_rl.models.megatron.common import _round_up_to_multiple
 from nemo_rl.models.megatron.hybridep import (
     get_packed_seq_padding_mask,
@@ -52,6 +59,84 @@ from nemo_rl.utils.r3_trace import (
     trace_cp_routed_experts,
 )
 from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
+
+if TYPE_CHECKING:
+    from nemo_rl.models.megatron.draft.sequence_layout import DraftSequenceLayout
+
+
+def _build_draft_sequence_layout(**kwargs: Any) -> "DraftSequenceLayout":
+    from nemo_rl.models.megatron.draft.sequence_layout import (
+        build_draft_sequence_layout,
+    )
+
+    return build_draft_sequence_layout(**kwargs)
+
+
+def _draft_training_enabled(cfg: dict[str, Any]) -> bool:
+    """Whether a draft provider is enabled for this run.
+
+    The presence of ``draft_sample_ids`` is not proof: the data-plane worker
+    mixin attaches them to *every* presharded batch (``train_presharded``), so
+    an ordinary TQ batch carries them even with draft training off.
+    """
+    draft_cfg = cfg.get("draft")
+    if draft_cfg is None:
+        return False
+    if isinstance(draft_cfg, dict):
+        return bool(draft_cfg.get("enabled", False))
+    return bool(getattr(draft_cfg, "enabled", False))
+
+
+def _get_packed_draft_sequence_layout(
+    *,
+    data_dict: BatchedDataDict[Any],
+    cfg: dict[str, Any],
+    seq_length_key: Optional[str],
+    processed_inputs: "ProcessedInputs",
+    delegate_pack_to_model: bool,
+) -> Optional["DraftSequenceLayout"]:
+    if (
+        not cfg["sequence_packing"]["enabled"]
+        or not _draft_training_enabled(cfg)
+        or "draft_sample_ids" not in data_dict
+    ):
+        return None
+    if delegate_pack_to_model:
+        raise NotImplementedError(
+            "draft sequence layout requires canonical NeMo-RL sequence packing"
+        )
+    if seq_length_key is None or seq_length_key not in data_dict:
+        raise ValueError("packed draft training requires a sequence length field")
+    if processed_inputs.cu_seqlens_padded is None:
+        raise RuntimeError("packed draft training requires padded sequence boundaries")
+
+    logical_sample_ids = data_dict["draft_sample_ids"].to(dtype=torch.int64)
+    logical_lengths = data_dict[seq_length_key].to(
+        device=logical_sample_ids.device,
+        dtype=torch.int64,
+    )
+    cu_seqlens_q = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int64, device=logical_sample_ids.device),
+            logical_lengths.cumsum(dim=0),
+        )
+    )
+    cu_seqlens_q_padded = processed_inputs.cu_seqlens_padded.to(
+        device=logical_sample_ids.device,
+        dtype=torch.int64,
+    )
+    sequence_parallel = bool(cfg["megatron_cfg"]["sequence_parallel"])
+
+    return _build_draft_sequence_layout(
+        logical_sample_ids=logical_sample_ids,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        cp_rank=get_context_parallel_rank(),
+        cp_size=get_context_parallel_world_size(),
+        tp_rank=get_tensor_model_parallel_rank() if sequence_parallel else 0,
+        tp_size=get_tensor_model_parallel_world_size() if sequence_parallel else 1,
+        device=logical_sample_ids.device,
+    )
 
 
 @dataclass
@@ -72,6 +157,7 @@ class ProcessedInputs:
     loss_mask_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
+    draft_sequence_layout: Optional[DraftSequenceLayout] = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +197,8 @@ class ProcessedMicrobatch:
         media_token_validity_mask: Which media-token positions actually anchor a
             projected feature, in the model's own token layout. None when the
             batch needs no correction and the model should derive its own.
+        draft_sequence_layout: Canonical packed/CP/SP coordinate map for draft
+            training, when the current microbatch requested one.
     """
 
     data_dict: BatchedDataDict[Any]
@@ -128,6 +216,98 @@ class ProcessedMicrobatch:
     loss_mask_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
+    draft_sequence_layout: Optional[DraftSequenceLayout] = None
+
+
+def _validate_direct_packed_microbatch(
+    data_dict: BatchedDataDict[Any],
+    *,
+    context_parallel_size: int,
+) -> DirectPackedMetadata:
+    """Validate direct-packed metadata before the batch moves to CUDA."""
+    required_keys = {
+        "target_ids",
+        "token_mask",
+        "sample_mask",
+        "position_ids",
+        "packed_cu_seqlens",
+        "packed_cu_seqlens_lengths",
+        "packed_max_seqlen",
+    }
+    missing_keys = sorted(required_keys.difference(data_dict.keys()))
+    if missing_keys:
+        raise ValueError(
+            "Megatron direct packed rows are missing required fields: "
+            + ", ".join(missing_keys)
+        )
+
+    input_ids = data_dict["input_ids"]
+    if input_ids.shape[0] != 1:
+        raise ValueError(
+            "Megatron direct packed microbatches must contain exactly one row"
+        )
+    for key in ("target_ids", "token_mask", "position_ids"):
+        if data_dict[key].shape != input_ids.shape:
+            raise ValueError(
+                f"{key} must have shape {tuple(input_ids.shape)} for a "
+                "Megatron direct packed row"
+            )
+    if data_dict["sample_mask"].shape != (1,):
+        raise ValueError("sample_mask must have shape (1,) for a direct packed row")
+
+    cu_lengths = data_dict["packed_cu_seqlens_lengths"]
+    packed_max_seqlen = data_dict["packed_max_seqlen"]
+    if cu_lengths.shape != (1,) or packed_max_seqlen.shape != (1,):
+        raise ValueError(
+            "packed_cu_seqlens_lengths and packed_max_seqlen must have "
+            "shape (1,) for a direct packed microbatch"
+        )
+
+    cu_len = int(cu_lengths[0].item())
+    packed_cu_seqlens = data_dict["packed_cu_seqlens"]
+    if packed_cu_seqlens.ndim != 2 or not 2 <= cu_len <= packed_cu_seqlens.shape[1]:
+        raise ValueError("packed_cu_seqlens_lengths is invalid for the packed row")
+
+    boundaries = [
+        int(boundary)
+        for boundary in packed_cu_seqlens[0, :cu_len].detach().cpu().tolist()
+    ]
+    segment_lengths = [end - start for start, end in zip(boundaries, boundaries[1:])]
+    if (
+        boundaries[0] != 0
+        or boundaries[-1] != input_ids.shape[1]
+        or any(length <= 0 for length in segment_lengths)
+    ):
+        raise ValueError(
+            "packed_cu_seqlens must contain increasing boundaries from 0 "
+            "through the packed row length"
+        )
+    resolved_max_seqlen = int(packed_max_seqlen[0].item())
+    if resolved_max_seqlen != max(segment_lengths):
+        raise ValueError(
+            "packed_max_seqlen must equal the longest packed segment "
+            f"({max(segment_lengths)})"
+        )
+    if context_parallel_size > 1 and any(
+        length % (2 * context_parallel_size) != 0 for length in segment_lengths
+    ):
+        raise ValueError(
+            "Direct packed SFT segment lengths must be divisible by "
+            f"2 * context_parallel_size ({2 * context_parallel_size})"
+        )
+
+    target_aligned_loss_mask = data_dict["token_mask"] * data_dict[
+        "sample_mask"
+    ].unsqueeze(-1)
+    if "mtp_loss_mask" in data_dict and not torch.equal(
+        data_dict["mtp_loss_mask"], target_aligned_loss_mask
+    ):
+        raise ValueError("mtp_loss_mask must match the direct target-aligned loss mask")
+
+    return DirectPackedMetadata(
+        cu_seqlens_length=cu_len,
+        max_seqlen=resolved_max_seqlen,
+    )
 
 
 def _validate_direct_packed_microbatch(
@@ -289,6 +469,13 @@ def make_processed_microbatch_iterator(
             prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
             mtp_enabled=mtp_enabled,
         )
+        draft_sequence_layout = _get_packed_draft_sequence_layout(
+            data_dict=data_dict,
+            cfg=cfg,
+            seq_length_key=seq_length_key,
+            processed_inputs=processed_inputs,
+            delegate_pack_to_model=delegate_pack_to_model,
+        )
 
         yield ProcessedMicrobatch(
             data_dict=data_dict,
@@ -306,6 +493,11 @@ def make_processed_microbatch_iterator(
             routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
             original_seq_length=processed_inputs.original_seq_length,
             media_token_validity_mask=processed_inputs.media_token_validity_mask,
+            draft_sequence_layout=(
+                draft_sequence_layout
+                if draft_sequence_layout is not None
+                else processed_inputs.draft_sequence_layout
+            ),
         )
 
 
@@ -1963,16 +2155,7 @@ def _shard_routed_experts_for_cp(
 def _get_packed_sequence_alignment_factors(
     megatron_cfg: dict[str, Any],
 ) -> tuple[int, int]:
-    tp_size = megatron_cfg["tensor_model_parallel_size"]
-    sp = megatron_cfg["sequence_parallel"]
-    cp_size = megatron_cfg["context_parallel_size"]
-
-    domain_factor = 1
-    if cp_size > 1:
-        domain_factor *= cp_size * 2
-    if tp_size > 1 and sp:
-        domain_factor *= tp_size
-
+    domain_factor = get_parallel_token_alignment(megatron_cfg)
     kernel_divisor = get_fp8_token_alignment(megatron_cfg)
     if (
         megatron_cfg.get("moe_token_dispatcher_type") == "flex"

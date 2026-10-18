@@ -103,3 +103,21 @@ def test_sharded_state_dict_accepts_full_nested_mcore_protocol() -> None:
 
     assert parameter_names == ["self", "prefix", "sharded_offsets", "metadata"]
     assert "sharded_state_dict_default" in _called_names(sharded_state_dict)
+
+
+def test_cp_exchange_gathers_only_projected_kv_inside_attention() -> None:
+    body_tree = ast.parse(_BODY_PATH.read_text())
+    attention_tree = ast.parse(_ATTENTION_PATH.read_text())
+    body_forward = _method(body_tree, "DFlashBody", "forward")
+    attention_forward = _function(attention_tree, "dflash_block_only_attention")
+
+    assert "gather_projected_kv" not in _called_names(body_forward)
+    assert _called_names(attention_forward).count("gather_projected_kv") == 2
+    assert [argument.arg for argument in body_forward.args.kwonlyargs][-2:] == [
+        "sequence_layout",
+        "context_parallel_group",
+    ]
+    assert [argument.arg for argument in attention_forward.args.kwonlyargs][-3:-1] == [
+        "sequence_layout",
+        "context_parallel_group",
+    ]

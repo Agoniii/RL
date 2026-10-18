@@ -355,6 +355,8 @@ policy:
     loss_weight: 0.1
     num_layers: null
     aux_layer_indices: null
+    optimizer: null
+
     token_chunk_size: 4096
     optimizer: null
 

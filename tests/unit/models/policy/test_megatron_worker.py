@@ -1540,9 +1540,9 @@ def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
     logical_weight = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
     bf16_source = torch.ones((2, 2), dtype=torch.bfloat16)
     dequantize = MagicMock(
-        side_effect=lambda tensor: logical_weight
-        if tensor is quantized_source
-        else tensor
+        side_effect=lambda tensor: (
+            logical_weight if tensor is quantized_source else tensor
+        )
     )
     monkeypatch.setattr(
         worker_module,

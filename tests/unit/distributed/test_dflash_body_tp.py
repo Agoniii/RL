@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -442,6 +443,39 @@ def _run_tp2_rank_local_valid_shapes_fail_before_first_projection(
     ]
 
 
+def _run_tp2_target_qk_layernorm_finalize_collective_is_not_bypassed(
+    rank: int, world_size: int
+) -> None:
+    from megatron.core.distributed.finalize_model_grads import (
+        _allreduce_non_tensor_model_parallel_grads,
+    )
+
+    device = torch.device("cuda", rank)
+    target = torch.nn.Module()
+    target.q_layernorm = torch.nn.LayerNorm(8, elementwise_affine=True).to(device)
+    target.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
+    assert target.q_layernorm.weight is not None
+    target.q_layernorm.weight.grad = torch.full(
+        (8,),
+        float(rank + 1),
+        device=device,
+    )
+    before = [torch.empty(8, device=device) for _ in range(world_size)]
+    torch.distributed.all_gather(before, target.q_layernorm.weight.grad)
+    assert not torch.equal(before[0], before[1])
+
+    _allreduce_non_tensor_model_parallel_grads(
+        [target],
+        SimpleNamespace(sequence_parallel=False, qk_layernorm=True),
+        torch.distributed.group.WORLD,
+    )
+
+    after = [torch.empty(8, device=device) for _ in range(world_size)]
+    torch.distributed.all_gather(after, target.q_layernorm.weight.grad)
+    assert torch.equal(after[0], after[1])
+    assert torch.equal(after[0], torch.full((8,), 3.0, device=device))
+
+
 def _run_tp2_rejects_sequence_parallel_config(rank: int, world_size: int) -> None:
     parallel_config = _fp32_parallel_config(2, sequence_parallel=True)
 
@@ -556,6 +590,15 @@ def test_tp2_rank_local_valid_shapes_fail_before_first_projection(
 ) -> None:
     distributed_test_runner(
         _run_tp2_rank_local_valid_shapes_fail_before_first_projection, world_size=2
+    )
+
+
+def test_tp2_target_qk_layernorm_finalize_collective_is_not_bypassed(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(
+        _run_tp2_target_qk_layernorm_finalize_collective_is_not_bypassed,
+        world_size=2,
     )
 
 

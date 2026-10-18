@@ -847,8 +847,6 @@ def dflash_projected_vocab_parallel_soft_ce(
 ) -> DraftLossStats:
     """Map DFlash block slots to the live target head and indexed teacher rows.
 
-    Called from the DFlash training path added in PR #3757.
-
     Slot 0 is the verified anchor token and is always excluded from the loss: this
     function overrides ``loss_mask[:, 0]`` to False regardless of what the caller
     passed. The returned ``DraftLossStats.counts`` is a rank-local ``(gamma,)``
@@ -949,6 +947,22 @@ def dflash_projected_vocab_parallel_soft_ce(
         torch.tensor(position_decay, dtype=torch.float32, device=draft_hidden.device),
         torch.arange(gamma, dtype=torch.float32, device=draft_hidden.device),
     )
+    if num_blocks == 0:
+        if output_weight.ndim != 2 or output_weight.shape[1] != draft_hidden.shape[-1]:
+            raise ValueError(
+                "output_weight must be a vocabulary-by-hidden matrix matching "
+                f"draft_hidden, got {output_weight.shape} and {draft_hidden.shape}."
+            )
+        if output_weight.device != draft_hidden.device:
+            raise ValueError("output_weight and draft_hidden must share a device.")
+        if output_weight.dtype != draft_hidden.dtype:
+            raise ValueError("output_weight and draft_hidden must share a dtype.")
+        zero = draft_hidden.sum(dtype=torch.float32)
+        return DraftLossStats(
+            numerators=zero.expand(gamma),
+            counts=torch.zeros(gamma, dtype=torch.float32, device=draft_hidden.device),
+            weights=weights,
+        )
     selected_teacher_logits = (
         teacher_logits.detach()
         .reshape(-1, teacher_logits.shape[-1])

@@ -17,7 +17,7 @@ from typing import Any, Literal, NotRequired, TypedDict, Union
 from pydantic import BaseModel
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.models.policy.draft_config import DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
@@ -698,7 +698,7 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
-    draft: NotRequired[Eagle3DraftConfig]
+    draft: NotRequired[DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     # Resolved once by the driver and carried to the student workers and (via
     # deepcopy) to the teacher group. Absent means full-vocabulary MOPD is off.
