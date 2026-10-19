@@ -182,11 +182,12 @@ def test_mcore_nccl_m2n_builds_hybrid_group_and_copy_service(
     )
 
 
-def test_megatron_fp8_refit_tasks_match_payload_mode() -> None:
+def test_megatron_fp8_refit_tasks_match_payload_mode(monkeypatch) -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
+    monkeypatch.delenv("NRL_REFIT_SKIP_MTP", raising=False)
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.fp8_cfg = {"fp8_param": True, "fp8_recipe": "blockwise"}
     worker.model = object()
@@ -204,6 +205,35 @@ def test_megatron_fp8_refit_tasks_match_payload_mode() -> None:
     worker.refit_payload_mode = "hf_export"
     assert worker._build_refit_conversion_tasks() == physical_tasks
     worker.megatron_bridge.get_export_fp8_tasks.assert_called_once_with(worker.model)
+
+
+@pytest.mark.parametrize("skip_mtp", [False, True])
+@pytest.mark.parametrize(
+    ("fp8", "payload_mode"),
+    [(False, "hf_export"), (True, "hf_export"), (True, "logical_weights")],
+)
+def test_megatron_refit_skip_mtp_across_export_formats(
+    monkeypatch, skip_mtp, fp8, payload_mode
+):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    monkeypatch.setenv("NRL_REFIT_SKIP_MTP", "1" if skip_mtp else "0")
+    decoder = SimpleNamespace(global_param_name="language_model.decoder.weight")
+    mtp = SimpleNamespace(global_param_name="language_model.mtp.norm.weight")
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = {"fp8_param": fp8, "fp8_recipe": "blockwise"}
+    worker.model = object()
+    worker.refit_payload_mode = payload_mode
+    worker.megatron_bridge = SimpleNamespace(
+        get_export_fp8_tasks=MagicMock(return_value=[decoder, mtp]),
+        get_conversion_tasks=MagicMock(return_value=[None, decoder, mtp]),
+    )
+
+    assert worker._build_refit_conversion_tasks() == (
+        [decoder] if skip_mtp else [decoder, mtp]
+    )
 
 
 def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
