@@ -27,6 +27,7 @@ from transformers import AutoTokenizer
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.r3 import prepare_single_turn_replay
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -99,6 +100,9 @@ class ProcessedInputs:
     # Core inputs (always present)
     input_ids: torch.Tensor
     seq_len: int
+    # Optional policy-only payloads, [B,S,L,K] and [B,S,L], respectively.
+    routed_experts: Optional[torch.Tensor] = None
+    route_source: Optional[torch.Tensor] = None
 
     # Optional tensors (None when not applicable)
     attention_mask: Optional[torch.Tensor] = None
@@ -149,6 +153,7 @@ def make_processed_microbatch_iterator(
     raw_iterator: Iterator[BatchedDataDict[Any]],
     tokenizer: AutoTokenizer,
     cfg: dict[str, Any],
+    use_router_replay: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -178,6 +183,7 @@ def make_processed_microbatch_iterator(
             tokenizer,
             enable_seq_packing,
             cfg,
+            use_router_replay=use_router_replay,
         )
 
         yield ProcessedMicrobatch(
@@ -194,6 +200,7 @@ def get_microbatch_iterator(
     mbs: int,
     dp_mesh: Any,  # noqa: ARG001
     tokenizer: AutoTokenizer,
+    use_router_replay: bool = False,
 ) -> tuple[Iterator[ProcessedMicrobatch], int]:
     """Create processed microbatch iterator based on batching strategy.
 
@@ -237,6 +244,7 @@ def get_microbatch_iterator(
         itertools.chain(mb_iterator, dummy_iterator),
         tokenizer,
         cfg,
+        use_router_replay=use_router_replay,
     )
     return processed_iterator, iterator_len
 
@@ -246,6 +254,8 @@ def process_microbatch(
     tokenizer: AutoTokenizer,
     enable_seq_packing: bool,
     cfg: dict[str, Any],
+    *,
+    use_router_replay: bool = False,
 ) -> ProcessedInputs:
     """Process a microbatch and prepare inputs for model forward.
 
@@ -259,6 +269,13 @@ def process_microbatch(
         ProcessedInputs containing all tensors and metadata for forward pass
     """
     input_ids = mb.get("input_ids").cuda()
+    routed_experts, route_source = None, None
+    if use_router_replay:
+        if enable_seq_packing:
+            raise ValueError("AutoModel R3 base does not support sequence packing")
+        routed_experts, route_source = prepare_single_turn_replay(mb)
+        routed_experts = routed_experts.to(input_ids.device)
+        route_source = route_source.to(input_ids.device)
 
     if enable_seq_packing:
         input_ids, position_ids, _ = pack_sequences(
@@ -318,6 +335,8 @@ def process_microbatch(
         flash_attn_kwargs=flash_attn_kwargs,
         vlm_kwargs=vlm_kwargs,
         seq_len=seq_len,
+        routed_experts=routed_experts,
+        route_source=route_source,
     )
 
 

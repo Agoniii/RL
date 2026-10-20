@@ -26,6 +26,10 @@ from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.router_replay import (
+    configure_vllm_for_router_replay as configure_vllm_for_router_replay,
+    router_replay_enabled,
+)
 from nemo_rl.utils.r3_trace import (
     trace_router_replay_action,
     trace_router_replay_assignment,
@@ -35,20 +39,6 @@ _ROUTER_REPLAY_VALIDATE_ENV = "NRL_ROUTER_REPLAY_VALIDATE"
 _ROUTER_REPLAY_EXCLUDE_MTP_ENV = "NRL_ROUTER_REPLAY_EXCLUDE_MTP"
 _MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 _MISSING_ROUTE_FALLBACK_PATCH_ATTR = "_nrl_missing_route_fallback_patch"
-
-
-def router_replay_enabled(config: PolicyConfig) -> bool:
-    return bool((config.get("router_replay") or {}).get("enabled", False))
-
-
-def configure_vllm_for_router_replay(config: PolicyConfig) -> None:
-    """Apply vLLM settings required for Megatron router replay correctness."""
-    if not router_replay_enabled(config):
-        return
-
-    generation = config.setdefault("generation", {})
-    vllm_kwargs = generation.setdefault("vllm_kwargs", {})
-    vllm_kwargs["enable_return_routed_experts"] = True
 
 
 def validate_router_replay_config(config: PolicyConfig) -> None:

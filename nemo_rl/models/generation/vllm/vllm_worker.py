@@ -25,6 +25,7 @@ import torch
 from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.r3 import build_route_source, encode_route_snapshot
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_VLLM_PORT_RANGE_LOW,
@@ -458,6 +459,7 @@ class BaseVllmGenerationWorker:
     ):
         """Lightweight config setup. No model loading, no heavy imports."""
         self.cfg = config
+        self._rollout_weight_version = 0
         self.model_name = self.cfg["model_name"]
         # Refined from the model's expert count in _load_model.
         self.routed_experts_dtype = ROUTED_EXPERTS_FALLBACK_DTYPE
@@ -1096,6 +1098,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         output_ids_list = []
         logprobs_list = []
         routed_experts_list = []
+        r3_snapshots = []
         r3_missing_routes = []
         r3_expected_routes = []
         r3_actual_routes = []
@@ -1133,6 +1136,22 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
             output_ids_list.append(full_output)
             full_logprobs = torch.zeros(total_length, dtype=torch.float32)
+            if self.cfg.get("_r3_snapshot_capture", False):
+                if (
+                    not generated_tokens
+                    or generation.logprobs is None
+                    or len(generation.logprobs) != len(generated_tokens)
+                    or any(
+                        not entry or entry.get(token_id) is None
+                        for token_id, entry in zip(
+                            generated_tokens, generation.logprobs
+                        )
+                    )
+                ):
+                    raise RuntimeError(
+                        "AutoModel R3 requires a nonempty response with a generation "
+                        "logprob for every sampled token"
+                    )
             if hasattr(generation, "logprobs") and generation.logprobs:
                 try:
                     for idx, (token_id, logprob_dict) in enumerate(
@@ -1145,6 +1164,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                                     sampled_logprob.logprob
                                 )
                 except Exception:
+                    if self.cfg.get("_r3_snapshot_capture", False):
+                        raise
                     import traceback
 
                     traceback.print_exc()
@@ -1173,6 +1194,25 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 r3_actual_routes.append(r3_stats["actual_routes"])
             if full_routed_experts is not None:
                 routed_experts_list.append(full_routed_experts)
+                if self.cfg.get("_r3_snapshot_capture", False):
+                    route_source = build_route_source(
+                        full_routed_experts,
+                        r3_stats,
+                        valid_length=response_length,
+                    )
+                    r3_snapshots.append(
+                        encode_route_snapshot(
+                            request_id=str(output.request_id),
+                            policy_version=self._rollout_weight_version,
+                            token_ids=full_output[:response_length],
+                            response_start=int(sequence_length),
+                            generation_logprobs=full_logprobs[
+                                sequence_length:response_length
+                            ],
+                            routed_experts=full_routed_experts[:response_length],
+                            route_source=route_source[:response_length],
+                        )
+                    )
 
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
@@ -1221,6 +1261,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
         if routed_experts_list:
             return_data["routed_experts"] = torch.stack(routed_experts_list)
+        if r3_snapshots:
+            return_data["r3_snapshot"] = r3_snapshots
         if r3_missing_routes:
             return_data["r3_routed_experts_missing_routes"] = torch.tensor(
                 r3_missing_routes, dtype=torch.long
@@ -1233,6 +1275,10 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             )
 
         return return_data
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Stamp subsequent synchronous generation requests with their weight version."""
+        self._rollout_weight_version = int(version)
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate_text")
     def generate_text(

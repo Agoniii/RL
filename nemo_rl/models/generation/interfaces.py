@@ -44,6 +44,7 @@ ROUTED_EXPERTS_FALLBACK_DTYPE = torch.int16
 # own router for those rows. Partially-negative rows are rejected as corruption.
 ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL = -1
 
+
 _ROUTED_EXPERTS_DTYPE_NAMES = {
     torch.int8: "int8",
     torch.int16: "int16",
@@ -245,6 +246,7 @@ class GenerationConfig(TypedDict):
     # Internal debug-only measurement of exact Ray generation arguments.
     # Populated from grpo.debug_payload_metrics; not meant to be set by the user.
     _debug_payload_metrics: NotRequired[bool]
+    _r3_snapshot_capture: NotRequired[bool]
 
 
 def should_use_async_rollouts(
@@ -392,6 +394,7 @@ class GenerationOutputSpec(TypedDict):
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
     routed_experts: NotRequired[torch.Tensor]
+    r3_snapshot: NotRequired[list[str]]
     r3_routed_experts_missing_routes: NotRequired[torch.Tensor]
     r3_routed_experts_expected_routes: NotRequired[torch.Tensor]
     r3_routed_experts_actual_routes: NotRequired[torch.Tensor]

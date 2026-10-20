@@ -13,6 +13,10 @@ Megatron MoE policy training with vLLM rollout generation. Other
 inference/generation backends are not wired into this path and have not been
 tested with Router Replay.
 
+An experimental single-turn AutoModel V2 path is described separately in
+[AutoModel routing replay](automodel-router-replay.md), including its stricter
+scope, dependency requirement, and outstanding GPU acceptance checks.
+
 ## Configuration
 
 Set `policy.router_replay.enabled=true` in the training config:

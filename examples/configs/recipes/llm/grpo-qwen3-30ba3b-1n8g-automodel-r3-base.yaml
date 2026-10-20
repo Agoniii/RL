@@ -1,0 +1,81 @@
+# Experimental acceptance recipe; two steps exercise refit and replay.
+# This is a smoke configuration, not a convergence or performance recipe.
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 4
+  max_rollout_turns: 1
+  max_num_steps: 2
+  val_period: -1
+  val_at_start: false
+  val_at_end: false
+  async_grpo:
+    enabled: false
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  force_on_policy_ratio: false
+checkpointing:
+  enabled: false
+policy:
+  model_name: Qwen/Qwen3-30B-A3B
+  precision: bfloat16
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 512
+  router_replay:
+    enabled: true
+  megatron_cfg:
+    enabled: false
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: true
+    automodel_kwargs:
+      force_hf: false
+      use_liger_kernel: false
+      moe_overrides:
+        aux_loss_coeff: 0.0
+        gate_bias_update_factor: 0.0
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: torch
+        rms_norm: torch_fp32
+        experts: torch
+        dispatcher: torch
+        fake_balanced_gate: false
+        rope_fusion: false
+        compile_attn: false
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: false
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  generation:
+    backend: vllm
+    max_new_tokens: 128
+    vllm_cfg:
+      async_engine: false
+      tensor_parallel_size: 8
+      expert_parallel_size: 1
+      enable_prefix_caching: false
+      enforce_eager: true
+    vllm_kwargs:
+      moe_backend: triton
+data:
+  max_input_seq_length: 384
+data_plane:
+  enabled: false
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-1n8g-automodel-r3-base
+  wandb_enabled: false
+  tensorboard_enabled: true

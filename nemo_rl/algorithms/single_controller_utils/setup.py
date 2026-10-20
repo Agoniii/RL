@@ -124,7 +124,8 @@ from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.megatron.router_replay import (
+from nemo_rl.models.router_replay import (
+    automodel_router_replay_enabled,
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
@@ -292,6 +293,8 @@ def _register_single_controller_partitions(
     policy_config = master_config.policy
     token_capture_cfg = master_config.token_capture
     r3_enabled = router_replay_enabled(policy_config)
+    if automodel_router_replay_enabled(policy_config):
+        raise ValueError("AutoModel R3 base does not support SingleController/TQ")
     group_size = algo_cfg.num_generations_per_prompt
     num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
 

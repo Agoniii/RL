@@ -41,6 +41,12 @@ from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.automodel.router_replay import (
+    automodel_router_replay_context,
+    validate_automodel_router_replay_model,
+    verify_automodel_router_replay,
+)
+from nemo_rl.models.router_replay import router_replay_enabled
 from nemo_rl.models.automodel.setup import (
     setup_distributed,
     setup_model_and_optimizer,
@@ -63,6 +69,7 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
+    ReferenceLogprobOutputSpec,
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
@@ -355,6 +362,7 @@ class DTensorPolicyWorkerV2Impl(
             self.peft_config,
             self.autocast_enabled,
         ) = model_and_optimizer_state
+        self._router_replay_enabled = router_replay_enabled(config)
 
         # Initialize reference model if requested. With deferred loading the
         # model still holds the base (model_name) weights here, so the KL
@@ -465,6 +473,8 @@ class DTensorPolicyWorkerV2Impl(
 
             losses = []
             all_mb_metrics = []
+            did_update = False
+            grad_norm = None
             for gb_idx in range(num_global_batches):
                 # Process global batch and compute normalization factors
                 gb_result = process_global_batch(
@@ -477,6 +487,9 @@ class DTensorPolicyWorkerV2Impl(
                 batch = gb_result["batch"]
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
+                if self._router_replay_enabled and global_valid_toks.item() == 0:
+                    losses.append(0.0)
+                    continue
 
                 self.optimizer.zero_grad()
 
@@ -487,6 +500,7 @@ class DTensorPolicyWorkerV2Impl(
                     mbs,
                     self.dp_mesh,
                     tokenizer=self.tokenizer,
+                    use_router_replay=self._router_replay_enabled,
                 )
 
                 # Use automodel_forward_backward for the training loop
@@ -509,6 +523,7 @@ class DTensorPolicyWorkerV2Impl(
                     num_global_batches=num_global_batches,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
+                    use_router_replay=self._router_replay_enabled,
                 )
 
                 # Extract losses and metrics from results
@@ -550,14 +565,16 @@ class DTensorPolicyWorkerV2Impl(
 
                     # Update parameters and the non-gradient MoE routing bias.
                     self.optimizer.step()
-                    self._update_moe_gate_bias_if_supported()
+                    did_update = True
+                    if not self._router_replay_enabled:
+                        self._update_moe_gate_bias_if_supported()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
             # release gradient memory before rollouts
             self.optimizer.zero_grad()
             # increment scheduler after all batches in rollout are processed
-            if not eval_mode:
+            if not eval_mode and (not self._router_replay_enabled or did_update):
                 self.scheduler.step()
             # dynamic batch and sequence dims causes alot of fragmentation, so clear
             # the memory allocator before moving on
@@ -577,7 +594,10 @@ class DTensorPolicyWorkerV2Impl(
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
     def get_logprobs(
-        self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+        self,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        require_router_replay: bool = True,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
@@ -620,6 +640,7 @@ class DTensorPolicyWorkerV2Impl(
                 logprob_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
+                use_router_replay=self._router_replay_enabled and require_router_replay,
             )
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
@@ -634,7 +655,16 @@ class DTensorPolicyWorkerV2Impl(
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
 
-                with prepared.model_context_factory(), self._autocast_context():
+                with (
+                    prepared.model_context_factory(),
+                    self._autocast_context(),
+                    automodel_router_replay_context(
+                        self.model,
+                        processed_inputs.routed_experts,
+                        processed_inputs.route_source,
+                        enabled=self._router_replay_enabled and require_router_replay,
+                    ) as replay_assignments,
+                ):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     token_logprobs, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
@@ -644,6 +674,9 @@ class DTensorPolicyWorkerV2Impl(
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
+
+                    if self._router_replay_enabled and require_router_replay:
+                        verify_automodel_router_replay(replay_assignments)
 
                 # skip keeping the logprobs for the dummy batches
                 if batch_idx >= iterator_len:
@@ -666,6 +699,24 @@ class DTensorPolicyWorkerV2Impl(
 
         self.timer.stop("get_logprobs")
         return return_data
+
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_reference_policy_logprobs")
+    def get_reference_policy_logprobs(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
+        """Compute reference logprobs with native reference-policy routing."""
+        with self.use_reference_model():
+            reference_logprobs = self.get_logprobs(
+                data=data,
+                micro_batch_size=micro_batch_size,
+                require_router_replay=False,
+            )
+        result = BatchedDataDict[ReferenceLogprobOutputSpec]()
+        result["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
+        return result
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
@@ -1020,15 +1071,13 @@ class DTensorPolicyWorkerV2Impl(
 
             # - self.model is the original reference_model, now on CUDA
             # - curr_state_dict is the train model, now on CPU
-            yield
-
-            # Restore sampling_params
-            self.sampling_params = saved_sampling_params
-
-            # Restore train model state_dict
-            for k, v in self.model.state_dict().items():
-                val = to_local_if_dtensor(v)
-                val.copy_(curr_state_dict[k])
+            try:
+                yield
+            finally:
+                self.sampling_params = saved_sampling_params
+                for k, v in self.model.state_dict().items():
+                    val = to_local_if_dtensor(v)
+                    val.copy_(curr_state_dict[k])
 
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
@@ -1400,6 +1449,9 @@ class DTensorPolicyWorkerV2Impl(
             optimizer_path=optimizer_path,
             scheduler=self.scheduler,
         )
+
+        if self._router_replay_enabled:
+            validate_automodel_router_replay_model(self.model)
 
     def _init_checkpoint_manager(
         self,

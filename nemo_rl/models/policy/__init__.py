@@ -172,6 +172,9 @@ class AutomodelKwargs(TypedDict):
     # auto-detected and set at runtime if not explicitly configured.
     # See: https://github.com/NVIDIA-NeMo/RL/issues/2072
     force_hf: NotRequired[bool]
+    # Model-level MoEConfig overrides. R3 requires explicit zero auxiliary
+    # coefficients and injects enable_routing_replay=true during setup.
+    moe_overrides: NotRequired[dict[str, bool | float]]
 
 
 class DTensorConfigDisabled(TypedDict):

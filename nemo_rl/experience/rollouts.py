@@ -591,6 +591,15 @@ def generate_responses(
     greedy: bool = False,
 ) -> tuple[BatchedDataDict[DatumSpec], list[torch.Tensor], dict[str, float | int]]:
     """Generate responses from policy using synchronous generation."""
+    if any(
+        "r3_snapshot" in message
+        for message_log in batch["message_log"]
+        for message in message_log
+    ):
+        raise ValueError(
+            "AutoModel R3 base supports only one rollout request per trajectory"
+        )
+
     # Add stop_strings to generation_input_data if present in the batch
     if "stop_strings" in batch:
         generation_input_data["stop_strings"] = batch["stop_strings"]
@@ -649,6 +658,9 @@ def generate_responses(
             assistant_message["routed_experts"] = routed_experts[
                 input_length:total_length
             ]
+
+        if "r3_snapshot" in generation_outputs:
+            assistant_message["r3_snapshot"] = generation_outputs["r3_snapshot"][i]
 
         batch["message_log"][i].append(assistant_message)
 

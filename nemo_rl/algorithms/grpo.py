@@ -125,7 +125,8 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
-from nemo_rl.models.megatron.router_replay import (
+from nemo_rl.models.router_replay import (
+    validate_automodel_r3_driver,
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
@@ -535,6 +536,13 @@ def setup(
 
     # Extract individual configs for easier access
     policy_config = master_config.policy
+    validate_automodel_r3_driver(
+        policy_config,
+        async_training=master_config.grpo.async_grpo.enabled,
+        use_tq=bool((master_config.data_plane or {}).get("enabled")),
+        use_gym=should_use_nemo_gym(master_config),
+        max_rollout_turns=master_config.grpo.max_rollout_turns,
+    )
     generation_config = policy_config["generation"]
     loss_config: ClippedPGLossConfig = master_config.loss_fn
     env_configs = master_config.env
@@ -2321,6 +2329,11 @@ def _preserve_router_replay_routed_experts(
     """Carry rollout-recorded routes into policy worker inputs when R3 is enabled."""
     if router_replay_enabled(policy_config) and "routed_experts" in flat_messages:
         target["routed_experts"] = flat_messages["routed_experts"]
+        if "r3_snapshot" in flat_messages:
+            target["r3_snapshots"] = [
+                json.dumps(row) for row in flat_messages["r3_snapshot"]
+            ]
+            target["generation_logprobs"] = flat_messages["generation_logprobs"]
 
 
 def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:
@@ -3141,6 +3154,10 @@ def _grpo_train_impl(
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation
                         policy_generation.prepare_for_generation()
+                    if master_config.policy["generation"].get(
+                        "_r3_snapshot_capture", False
+                    ):
+                        policy_generation.set_rollout_weight_version(total_steps)
 
                 dynamic_sampling_num_gen_batches += 1
                 if dynamic_sampling_num_gen_batches == 1 and hasattr(

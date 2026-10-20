@@ -61,6 +61,10 @@ from nemo_rl.models.automodel.data import (
     ProcessedMicrobatch,
     filter_multimodal_kwargs_for_model,
 )
+from nemo_rl.models.automodel.router_replay import (
+    automodel_router_replay_context,
+    verify_automodel_router_replay,
+)
 from nemo_rl.models.policy import PolicyConfig
 
 # Union type for any post-processing function
@@ -432,6 +436,7 @@ def automodel_forward_backward(
     num_global_batches: int = 1,
     num_valid_microbatches: Optional[int] = None,
     on_microbatch_start: Optional[Callable[[int], None]] = None,
+    use_router_replay: bool = False,
 ) -> list[Tuple[Any, dict[str, Any]]]:
     """Execute forward and backward passes for automodel.
 
@@ -484,7 +489,18 @@ def automodel_forward_backward(
             allow_flash_attn_args=allow_flash_attn_args,
         )
 
-        with prepared.model_context_factory(), autocast_context_factory():
+        if use_router_replay and prepared.cp_size != 1:
+            raise ValueError("AutoModel R3 base requires CP=1")
+        with (
+            prepared.model_context_factory(),
+            autocast_context_factory(),
+            automodel_router_replay_context(
+                model,
+                processed_mb.processed_inputs.routed_experts,
+                processed_mb.processed_inputs.route_source,
+                enabled=use_router_replay,
+            ) as replay_assignments,
+        ):
             # Forward pass with post-processing
             result, metrics, _ = forward_with_post_processing_fn(
                 model=model,
@@ -535,6 +551,8 @@ def automodel_forward_backward(
                         / post_processing_fn.cp_gradient_fanout
                     )
                     loss.backward()
+            if use_router_replay:
+                verify_automodel_router_replay(replay_assignments)
 
         results.append((result, metrics))
 
