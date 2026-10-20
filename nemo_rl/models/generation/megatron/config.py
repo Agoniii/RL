@@ -252,6 +252,21 @@ def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]
     return merged
 
 
+def dedicated_inference_world_size(policy_config: PolicyConfig) -> int:
+    """Ranks one dedicated (non-colocated) Megatron inference engine spans.
+
+    Derived from the same merged layout the engine's workers are built with,
+    so callers that size placement groups or refit collectives never recompute
+    it from raw config keys.
+    """
+    merged = merged_inference_megatron_cfg(policy_config)
+    return int(
+        merged["tensor_model_parallel_size"]
+        * merged.get("pipeline_model_parallel_size", 1)
+        * merged["context_parallel_size"]
+    )
+
+
 def dedicated_inference_megatron_cfg(
     policy_config: PolicyConfig,
 ) -> Optional[dict[str, Any]]:
